@@ -3,34 +3,38 @@ try:
 except ImportError:
     import config
 from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium_stealth import stealth
+
+# from selenium_stealth import stealth
 import asyncio
-from bs4 import BeautifulSoup
 from utils import (
     getChannelItems,
     updateChannelUrlsTxt,
     updateFile,
-    getUrlInfo,
-    compareSpeedAndResolution,
-    getTotalUrls,
-    checkUrlIPVType,
-    checkByDomainBlacklist,
-    checkByURLKeywordsBlacklist,
+    sortUrlsBySpeedAndResolution,
+    getTotalUrlsFromInfoList,
+    getTotalUrlsFromSortedData,
     filterUrlsByPatterns,
+    useAccessibleUrl,
+    getChannelsBySubscribeUrls,
+    checkUrlByPatterns,
+    getFOFAUrlsFromRegionList,
+    getChannelsByFOFA,
+    mergeObjects,
+    getChannelsInfoListByOnlineSearch,
+    formatChannelName,
 )
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 from tqdm import tqdm
+import re
+import time
 
+handler = RotatingFileHandler("result_new.log", encoding="utf-8")
 logging.basicConfig(
-    filename="result_new.log",
-    filemode="a",
+    handlers=[handler],
     format="%(message)s",
     level=logging.INFO,
-    encoding="utf-8",
 )
 
 
@@ -45,23 +49,41 @@ class UpdateSource:
         options.add_argument("blink-settings=imagesEnabled=false")
         options.add_argument("--log-level=3")
         driver = webdriver.Chrome(options=options)
-        stealth(
-            driver,
-            languages=["en-US", "en"],
-            vendor="Google Inc.",
-            platform="Win32",
-            webgl_vendor="Intel Inc.",
-            renderer="Intel Iris OpenGL Engine",
-            fix_hairline=True,
-        )
+        # stealth(
+        #     driver,
+        #     languages=["en-US", "en"],
+        #     vendor="Google Inc.",
+        #     platform="Win32",
+        #     webgl_vendor="Intel Inc.",
+        #     renderer="Intel Iris OpenGL Engine",
+        #     fix_hairline=True,
+        # )
         return driver
 
     def __init__(self):
         self.driver = self.setup_driver()
 
     async def visitPage(self, channelItems):
-        total_channels = sum(len(channelObj) for _, channelObj in channelItems.items())
+        channelNames = [
+            name for _, channelObj in channelItems.items() for name in channelObj.keys()
+        ]
+        if config.open_subscribe:
+            extendResults = await getChannelsBySubscribeUrls(channelNames)
+        if config.open_multicast:
+            fofa_urls = getFOFAUrlsFromRegionList()
+            fofa_results = {}
+            for url in fofa_urls:
+                if url:
+                    self.driver.get(url)
+                    time.sleep(10)
+                    fofa_source = re.sub(
+                        r"<!--.*?-->", "", self.driver.page_source, flags=re.DOTALL
+                    )
+                    fofa_channels = getChannelsByFOFA(fofa_source)
+                    fofa_results = mergeObjects(fofa_results, fofa_channels)
+        total_channels = len(channelNames)
         pbar = tqdm(total=total_channels)
+        pageUrl = await useAccessibleUrl() if config.open_online_search else None
         for cate, channelObj in channelItems.items():
             channelUrls = {}
             channelObjKeys = channelObj.keys()
@@ -69,62 +91,51 @@ class UpdateSource:
                 pbar.set_description(
                     f"Processing {name}, {total_channels - pbar.n} channels remaining"
                 )
-                isFavorite = name in config.favorite_list
-                pageNum = (
-                    config.favorite_page_num if isFavorite else config.default_page_num
-                )
-                infoList = []
-                for page in range(1, pageNum + 1):
-                    try:
-                        page_url = f"https://www.foodieguide.com/iptvsearch/?page={page}&s={name}"
-                        self.driver.get(page_url)
-                        WebDriverWait(self.driver, 10).until(
-                            EC.presence_of_element_located(
-                                (By.CSS_SELECTOR, "div.tables")
-                            )
-                        )
-                        soup = BeautifulSoup(self.driver.page_source, "html.parser")
-                        tables_div = soup.find("div", class_="tables")
-                        results = (
-                            tables_div.find_all("div", class_="result")
-                            if tables_div
-                            else []
-                        )
-                        for result in results:
-                            try:
-                                url, date, resolution = getUrlInfo(result)
-                                if (
-                                    url
-                                    and checkUrlIPVType(url)
-                                    and checkByDomainBlacklist(url)
-                                    and checkByURLKeywordsBlacklist(url)
-                                ):
-                                    infoList.append((url, date, resolution))
-                            except Exception as e:
-                                print(f"Error on result {result}: {e}")
-                                continue
-                    except Exception as e:
-                        print(f"Error on page {page}: {e}")
-                        continue
+                format_name = formatChannelName(name)
+                info_list = []
+                if config.open_subscribe:
+                    for url, date, resolution in extendResults.get(format_name, []):
+                        if url and checkUrlByPatterns(url):
+                            info_list.append((url, None, resolution))
+                if config.open_multicast:
+                    for url in fofa_results.get(format_name, []):
+                        if url and checkUrlByPatterns(url):
+                            info_list.append((url, None, None))
+                if config.open_online_search and pageUrl:
+                    online_info_list = getChannelsInfoListByOnlineSearch(
+                        self.driver, pageUrl, format_name
+                    )
+                    if online_info_list:
+                        info_list.extend(online_info_list)
                 try:
-                    sorted_data = await compareSpeedAndResolution(infoList)
-                    if sorted_data:
-                        channelUrls[name] = (
-                            getTotalUrls(sorted_data) or channelObj[name]
-                        )
-                        for (url, date, resolution), response_time in sorted_data:
-                            logging.info(
-                                f"Name: {name}, URL: {url}, Date: {date}, Resolution: {resolution}, Response Time: {response_time}ms"
-                            )
-                    else:
+                    channelUrls[name] = filterUrlsByPatterns(
+                        getTotalUrlsFromInfoList(info_list)
+                    )
+                    github_actions = os.environ.get("GITHUB_ACTIONS")
+                    if (
+                        config.open_sort
+                        and not github_actions
+                        or (pbar.n <= 200 and github_actions == "true")
+                    ):
+                        sorted_data = await sortUrlsBySpeedAndResolution(info_list)
+                        if sorted_data:
+                            channelUrls[name] = getTotalUrlsFromSortedData(sorted_data)
+                            for (
+                                url,
+                                date,
+                                resolution,
+                            ), response_time in sorted_data:
+                                logging.info(
+                                    f"Name: {name}, URL: {url}, Date: {date}, Resolution: {resolution}, Response Time: {response_time}ms"
+                                )
+                    if len(channelUrls[name]) == 0:
                         channelUrls[name] = filterUrlsByPatterns(channelObj[name])
-                except Exception as e:
-                    print(f"Error on sorting: {e}")
+                except:
                     continue
                 finally:
                     pbar.update()
             updateChannelUrlsTxt(cate, channelUrls)
-            # await asyncio.sleep(1)
+            await asyncio.sleep(1)
         pbar.close()
 
     def main(self):
